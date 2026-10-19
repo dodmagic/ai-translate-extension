@@ -12,7 +12,40 @@ const AitSpeech = (() => {
     "es-MX": ["Sabina"],
     "fr-CA": ["Caroline"]
   };
+  // Chrome's built-in Google online voices (female, natural-sounding). Preferred over macOS voices.
+  const GOOGLE_VOICES = {
+    "en-US": ["Google US English"],
+    "zh-CN": ["Google 普通话（中国大陆）"],
+    "zh-TW": ["Google 國語（臺灣）"],
+    "ja-JP": ["Google 日本語"],
+    "ko-KR": ["Google 한국의"],
+    "fr-FR": ["Google français"],
+    "de-DE": ["Google Deutsch"],
+    "es-ES": ["Google español"],
+    "es-MX": [],
+    "fr-CA": []
+  };
+  const GOOGLE_TTS_EXTENSION_ID = "neajdppkdcdipfabeoofebfddakdcjhd";
+  // macOS system female voices, tried last; Premium/Enhanced variants win over compact ones.
+  // Chrome may report macOS voices by their localized names (e.g. 婷婷), so both forms are listed.
+  const MAC_FEMALE_VOICES = {
+    "en-US": ["Ava", "Zoe", "Allison", "Susan", "Samantha"],
+    "zh-CN": ["Lili", "莉莉", "Tingting", "婷婷", "Ting-Ting", "Yu-shu", "语舒"],
+    "zh-TW": ["Meijia", "Mei-Jia", "美佳"],
+    "ja-JP": ["Kyoko", "O-ren"],
+    "ko-KR": ["Yuna", "유나"],
+    "fr-FR": ["Audrey", "Marie", "Aurélie"],
+    "de-DE": ["Anna", "Petra", "Helena"],
+    "es-ES": ["Mónica", "Marisol"],
+    "es-MX": ["Paulina", "Angélica"],
+    "fr-CA": ["Amélie", "Chantal"]
+  };
+  // Known male or novelty voices that must never be used as a fallback.
+  const BLOCKED = /\b(?:Eddy|Grandpa|Reed|Rocko|Li-?Mu|Albert|Fred|Ralph|Junior|Daniel|Aaron|Tom|Alex|Evan|Nathan|Thomas|Jacques|Otoya|Hattori|Diego|Jorge|Juan|Carlos|Martin|Yannick|Rishi|Oliver|Arthur|David|Mark|Kangkang|Male|Bad News|Bahh|Bells|Boing|Bubbles|Cellos|Wobble|Good News|Jester|Organ|Superstar|Trinoids|Whisper|Zarvox|UK|British|Australia|India)\b|李牧|康康/i;
+  const NOVELTY = /^(?:Grandma|Shelley|Flo|Sandy)\b/i;
+  const QUALITY = /premium|enhanced|高品质|高音质|优化|增强/i;
   const DEFAULT_LOCALES = { zh: "zh-CN", ja: "ja-JP", ko: "ko-KR", fr: "fr-FR", de: "de-DE", es: "es-ES" };
+  const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
   function resolveLanguage(language) {
     if (typeof language !== "string") return null;
@@ -25,16 +58,44 @@ const AitSpeech = (() => {
 
   function selectVoice(voices, language) {
     const locale = resolveLanguage(language);
-    if (!locale) throw new Error(language ? "暂不支持该语言的微软女声：" + language : "无法可靠识别原文语言，不能选择发音。请尝试较完整的句子或谷歌翻译引擎。");
-    for (const name of FEMALE_VOICES[locale]) {
-      const pattern = new RegExp("^Microsoft " + name + "(?: Desktop)?(?: - .+)?$", "i");
-      const voice = voices.find((v) => !v.extensionId && v.remote !== true &&
-        typeof v.lang === "string" && v.lang.replace(/_/g, "-").toLowerCase() === locale.toLowerCase() &&
-        pattern.test(v.voiceName || "") && v.gender !== "male");
+    if (!locale) throw new Error(language ? "暂不支持该语言的女声发音：" + language : "无法可靠识别原文语言，不能选择发音。请尝试较完整的句子或谷歌翻译引擎。");
+    const sameLocale = (v) => typeof v.lang === "string" && normalizeLang(v.lang) === locale.toLowerCase() &&
+      v.gender !== "male";
+    const native = (v) => !v.extensionId && v.remote !== true;
+    const candidates = [
+      ...FEMALE_VOICES[locale].map((name) => ({ pattern: new RegExp("^Microsoft " + name + "(?: Desktop)?(?: - .+)?$", "i"), ok: native })),
+      ...GOOGLE_VOICES[locale].map((name) => ({
+        pattern: new RegExp("^" + escapeRegExp(name) + "$", "i"),
+        ok: (v) => !v.extensionId || v.extensionId === GOOGLE_TTS_EXTENSION_ID
+      })),
+      // e.g. "Samantha", "Ava (Premium)", "Lili (高品质)"
+      ...MAC_FEMALE_VOICES[locale].map((name) => ({ pattern: new RegExp("^" + escapeRegExp(name) + "(?: [(（].*[)）])?$", "i"), ok: native }))
+    ];
+    for (const { pattern, ok } of candidates) {
+      const matches = voices.filter((v) => ok(v) && sameLocale(v) && pattern.test(v.voiceName || ""));
+      const voice = matches.find((v) => QUALITY.test(v.voiceName)) || matches[0];
       if (voice) return { voice, locale };
     }
-    throw new Error("未找到 " + locale + " 微软女声（" + FEMALE_VOICES[locale].join(" / ") +
-      "）。请在 Windows 语言设置中安装对应的文本转语音语音包并重启当前浏览器；不会改用男性、英式或默认声音。");
+    // Fallback: any other voice of this locale (Google or system) that is not a known male/novelty voice.
+    const trusted = (v) => v.extensionId === GOOGLE_TTS_EXTENSION_ID || (!v.extensionId && (v.remote !== true || /^Google /i.test(v.voiceName || "")));
+    const rest = voices.filter((v) => trusted(v) && sameLocale(v) && v.voiceName && !BLOCKED.test(v.voiceName));
+    const rank = (v) => (/^Google /i.test(v.voiceName) ? 0 : QUALITY.test(v.voiceName) ? 1 : NOVELTY.test(v.voiceName) ? 3 : 2);
+    const fallback = rest.sort((a, b) => rank(a) - rank(b))[0];
+    if (fallback) return { voice: fallback, locale };
+    const available = voices.filter((v) => typeof v.lang === "string" && normalizeLang(v.lang).split("-")[0] === locale.split("-")[0].toLowerCase())
+      .map((v) => v.voiceName + "[" + v.lang + "]").slice(0, 12).join("、") || "无";
+    throw new Error("未找到 " + locale + " 女声（Windows：Microsoft " + FEMALE_VOICES[locale].join(" / ") +
+      "；Chrome：" + (GOOGLE_VOICES[locale][0] || "无") + "；macOS：" + MAC_FEMALE_VOICES[locale].slice(0, 3).join(" / ") +
+      " 等）。Windows 请在语言设置中安装对应的文本转语音语音包，" +
+      "macOS 请在 系统设置 › 辅助功能 › 朗读内容 › 系统声音 › 管理声音 中下载，然后重启浏览器；不会改用男性、英式或默认声音。" +
+      "当前浏览器可用的同语种声音：" + available);
+  }
+
+  function normalizeLang(lang) {
+    const code = lang.replace(/_/g, "-").toLowerCase();
+    if (code === "cmn-cn" || code === "cmn-hans-cn" || code === "zh-hans-cn" || code === "zh-hans") return "zh-cn";
+    if (code === "cmn-tw" || code === "cmn-hant-tw" || code === "zh-hant-tw" || code === "zh-hant") return "zh-tw";
+    return code;
   }
 
   function createController(api, notify) {

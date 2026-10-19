@@ -58,7 +58,7 @@ test("only known native Microsoft female voices with matching locale are selecte
     { ...zira, gender: "male" },
     { ...zira, remote: true },
     { ...zira, extensionId: "third-party" },
-    { ...zira, voiceName: "Google US English" }
+    { ...zira, voiceName: "Google UK English Female" }
   ]) assert.throws(() => subject.selectVoice([invalid], "en"), /en-US/);
   assert.throws(() => subject.selectVoice([], "en"), /Zira/);
   assert.throws(() => subject.selectVoice([zira], null), /识别/);
@@ -342,4 +342,40 @@ test("speech diagnostics only record allowlisted codes, never the selected text"
   const invalid = await h.send({ type: "SPEECH_DIAGNOSTIC", code: "private selected text" });
   assert.equal(invalid.ok, false);
   assert.doesNotMatch(h.logs.join("\n"), /private selected text/);
+});
+
+test("Chinese falls back to localized or unlisted female voices, never male/novelty ones first", () => {
+  const { subject } = harness();
+  const tingtingCn = { voiceName: "婷婷", lang: "zh-CN" };
+  const googleZhAlt = { voiceName: "Google 普通话(中国大陆)", lang: "zh_CN", remote: true };
+  const cmn = { voiceName: "Lili (Enhanced)", lang: "cmn-CN" };
+  const eddy = { voiceName: "Eddy (中文（中国大陆）)", lang: "zh-CN" };
+  const flo = { voiceName: "Flo (中文（中国大陆）)", lang: "zh-CN" };
+  assert.equal(subject.selectVoice([eddy, tingtingCn], "zh").voice, tingtingCn);
+  assert.equal(subject.selectVoice([eddy, flo, googleZhAlt], "zh").voice, googleZhAlt);
+  assert.equal(subject.selectVoice([cmn], "zh").voice, cmn);
+  assert.equal(subject.selectVoice([eddy, flo], "zh").voice, flo);
+  assert.throws(() => subject.selectVoice([eddy], "zh"), /Eddy/);
+});
+
+test("Chrome Google voices beat macOS voices; Premium macOS voices beat compact ones", () => {
+  const { subject } = harness();
+  const ext = "neajdppkdcdipfabeoofebfddakdcjhd";
+  const googleEn = { voiceName: "Google US English", lang: "en-US", remote: true, extensionId: ext };
+  const googleUk = { voiceName: "Google UK English Female", lang: "en-GB", remote: true, extensionId: ext };
+  const googleZh = { voiceName: "Google 普通话（中国大陆）", lang: "zh-CN", remote: true, extensionId: ext };
+  const samantha = { voiceName: "Samantha", lang: "en-US" };
+  const ava = { voiceName: "Ava (Premium)", lang: "en-US" };
+  const tingting = { voiceName: "Tingting", lang: "zh-CN" };
+  const lili = { voiceName: "Lili (高品质)", lang: "zh-CN" };
+  assert.equal(subject.selectVoice([samantha, googleUk, googleEn], "en").voice, googleEn);
+  assert.equal(subject.selectVoice([tingting, googleZh], "zh").voice, googleZh);
+  assert.equal(subject.selectVoice([googleEn, zira], "en").voice, zira);
+  assert.equal(subject.selectVoice([samantha, ava], "en").voice, ava);
+  assert.equal(subject.selectVoice([tingting, lili], "zh-CN").voice, lili);
+  assert.equal(subject.selectVoice([samantha], "en").voice, samantha);
+  for (const invalid of [googleUk, { ...googleEn, extensionId: "third-party" }, { voiceName: "Fred", lang: "en-US" },
+    { ...samantha, lang: "en-GB" }, { ...samantha, remote: true }]) {
+    assert.throws(() => subject.selectVoice([invalid], "en"), /en-US/);
+  }
 });
