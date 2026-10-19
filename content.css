@@ -30,6 +30,25 @@
 }
 .ait-result-loading { color: #aab; font-size: 13px; }
 .ait-result-text { white-space: pre-wrap; }
+.ait-result-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.ait-result-actions button {
+  appearance: none;
+  width: auto;
+  min-height: 28px;
+  margin: 0;
+  padding: 4px 8px;
+  border: 1px solid #565b74;
+  border-radius: 5px;
+  background: #30364d;
+  color: #f0f0f4;
+  font: 12px/1.5 -apple-system, "Segoe UI", sans-serif;
+  cursor: pointer;
+}
+.ait-result-actions button:hover, .ait-result-actions button[aria-pressed="true"] { background: #5a4bd6; }
+.ait-result-actions button:focus-visible { outline: 2px solid #b6afff; outline-offset: 2px; }
+.ait-result-actions .ait-close { margin-left: auto; }
+.ait-speech-status { color: #c3c7df; font-size: 12px; overflow-wrap: anywhere; }
+.ait-speech-status:not(:empty) { margin-top: 8px; }
 
 .ait-inline {
   color: #5a8dee;
