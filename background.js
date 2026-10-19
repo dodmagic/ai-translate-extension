@@ -4,8 +4,13 @@ importScripts("speech.js");
 
 const GOOGLE_ENDPOINT = "https://translate.googleapis.com/translate_a/single";
 const DEFAULTS = { targetLang: "zh-CN", provider: "google", apiUrl: "", apiKey: "", model: "gpt-5.4-mini" };
+let speechDiagnostics = Promise.resolve();
 
 const speech = AitSpeech.createController(chrome, (request, status) => {
+  if (status.state === "error") {
+    saveSpeechDiagnostic(status.code, status.phase);
+    if (status.stopFailed) saveSpeechDiagnostic("TTS_STOP_FAILED", status.phase);
+  }
   chrome.tabs.sendMessage(request.tabId, status, { frameId: request.frameId }, () => {
     if (chrome.runtime.lastError && status.state === "playing") {
       speech.stop(request.id, { tab: { id: request.tabId }, frameId: request.frameId });
@@ -36,6 +41,12 @@ async function log(line) {
   aitLog.unshift("[" + t + "] " + line);
   console.log("[AI翻译]", line);
   await chrome.storage.local.set({ aitLog: aitLog.slice(0, 30) });
+}
+
+function saveSpeechDiagnostic(code, phase = "request") {
+  speechDiagnostics = speechDiagnostics
+    .then(() => log("发音错误 " + code + " phase=" + phase))
+    .catch(() => console.warn("[AI翻译发音] 诊断日志保存失败"));
 }
 
 // 规范化 URL：兼容 OpenAI / Azure(v1 或经典) / Foundry
@@ -100,8 +111,20 @@ async function pool(items, n, fn) {
 const getCfg = () => new Promise((r) => chrome.storage.sync.get(DEFAULTS, r));
 
 chrome.runtime.onMessage.addListener((msg, sender, send) => {
+  if (msg.type === "SPEECH_DIAGNOSTIC") {
+    if (!["TTS_STOP_RESPONSE_FAILED", "TTS_RELOAD_REQUIRED", "TTS_FRONTEND_TIMEOUT"].includes(msg.code)) {
+      send({ ok: false, error: "无效的发音诊断" });
+      return;
+    }
+    saveSpeechDiagnostic(msg.code, "content");
+    send({ ok: true });
+    return;
+  }
   if (msg.type === "SPEAK_SELECTION") {
-    speech.play(msg, sender).then(send, (error) => send({ ok: false, error: error.message }));
+    speech.play(msg, sender).then(send, (error) => {
+      saveSpeechDiagnostic("TTS_REQUEST_FAILED");
+      send({ ok: false, error: error.message });
+    });
     return true;
   }
   if (msg.type === "STOP_SELECTION_SPEECH") {

@@ -1,5 +1,5 @@
 const { spawn } = require("node:child_process");
-const { mkdtemp, readFile, rm } = require("node:fs/promises");
+const { mkdtemp, readFile, rm, mkdir, copyFile, writeFile } = require("node:fs/promises");
 const path = require("node:path");
 const os = require("node:os");
 const http = require("node:http");
@@ -34,8 +34,140 @@ async function connect(url) {
   };
 }
 
+async function evaluate(client, expression) {
+  const result = await client.call("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
+  if (result.exceptionDetails) throw new Error(JSON.stringify(result.exceptionDetails));
+  return result.result.value;
+}
+
+async function waitForFixture(page) {
+  for (let i = 0; i < 100; i++) {
+    if (await evaluate(page, "!!document.querySelector('#sample')")) return;
+    await wait(100);
+  }
+  throw new Error("Fixture page did not finish loading");
+}
+
+async function checkLifecycle(browser, loaded, endpoint, localUrl, clients, fault) {
+  async function pageAt(url, background = false) {
+    const created = await browser.call("Target.createTarget", { url, background });
+    for (let i = 0; i < 100; i++) {
+      const targets = await (await fetch(endpoint + "/json/list")).json();
+      const target = targets.find((entry) => entry.id === created.targetId);
+      if (target?.webSocketDebuggerUrl) {
+        const client = await connect(target.webSocketDebuggerUrl);
+        clients.push(client);
+        return client;
+      }
+      await wait(100);
+    }
+    throw new Error("Page target did not start");
+  }
+  const control = await pageAt("chrome-extension://" + loaded.id + "/popup.html", true);
+  for (let i = 0; i < 100; i++) {
+    if (await evaluate(control, "!!globalThis.chrome?.runtime?.id")) break;
+    await wait(100);
+  }
+  const page = await pageAt(localUrl);
+  await waitForFixture(page);
+  const tabId = await evaluate(control, "chrome.tabs.query({url:'http://127.0.0.1/*'}).then(t=>t[0].id)");
+  const isSpeaking = () => evaluate(control, "new Promise(resolve=>chrome.tts.isSpeaking(resolve))");
+  async function waitStatus(pattern) {
+    let value;
+    for (let i = 0; i < 75; i++) {
+      value = await evaluate(page, "document.querySelector('.ait-speech-status')?.textContent || ''");
+      if (pattern.test(value)) return value;
+      await wait(200);
+    }
+    assert.match(value, pattern);
+  }
+  async function click(selector) {
+    await page.call("Page.bringToFront");
+    const rect = await evaluate(page, `(()=>{const r=document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()`);
+    await page.call("Input.dispatchMouseEvent", { type: "mousePressed", ...rect, button: "left", clickCount: 1 });
+    await page.call("Input.dispatchMouseEvent", { type: "mouseReleased", ...rect, button: "left", clickCount: 1 });
+  }
+  async function translate(selector, targetLang) {
+    await evaluate(control, `chrome.storage.sync.set({targetLang:${JSON.stringify(targetLang)}})`);
+    await evaluate(page, `getSelection().selectAllChildren(document.querySelector(${JSON.stringify(selector)})); true`);
+    await evaluate(control, `chrome.tabs.sendMessage(${tabId},{type:'TRANSLATE_SELECTION'})`);
+    for (let i = 0; i < 100; i++) {
+      if (await evaluate(page, "!!document.querySelector('.ait-speech')")) return;
+      await wait(200);
+    }
+    throw new Error("Translation did not render pronunciation buttons");
+  }
+  console.log("NO_SERVICE_WORKER_DEBUGGER", true, "REAL_POINTER_INPUT", true);
+  await translate("#sample", "zh-CN");
+  if (fault) {
+    const expected = ["voices", "stop"].includes(fault) ? /读取系统语音超时/ : fault === "message" ? /发音准备超时/ : /发音启动超时/;
+    await click(".ait-speech");
+    console.log("SIMULATED_FAILURE", fault, await waitStatus(expected));
+    assert.equal(await evaluate(page, "document.querySelector('.ait-speech').getAttribute('aria-pressed')"), "false");
+    assert.equal(await isSpeaking(), false);
+    let logs = [];
+    for (let i = 0; i < 50; i++) {
+      logs = await evaluate(control, "chrome.storage.local.get('aitLog').then(r=>r.aitLog || [])");
+      if (logs.some((line) => line.includes("TTS_") && line.includes("TIMEOUT"))) break;
+      await wait(100);
+    }
+    console.log("SAFE_DIAGNOSTICS", logs);
+    assert.ok(logs.some((line) => line.includes("TTS_") && line.includes("TIMEOUT")));
+    assert.ok(logs.every((line) => !line.includes("Hello world") && !line.includes("pronunciation test")));
+    return;
+  }
+  await wait(40000);
+  const workers = (await browser.call("Target.getTargets")).targetInfos.filter((target) => target.type === "service_worker" && target.url.startsWith("chrome-extension://" + loaded.id));
+  assert.equal(workers.length, 0, "Service worker must actually stop during idle");
+  console.log("WORKER_STOPPED_AFTER_IDLE", true);
+  for (const [selector, lang, source, target] of [
+    ["#sample", "zh-CN", /Zira.*en-US/, /Huihui.*zh-CN/],
+    ["#chinese", "en", /Huihui.*zh-CN/, /Zira.*en-US/]
+  ]) {
+    if (selector !== "#sample") await translate(selector, lang);
+    await click(".ait-speech");
+    console.log("NATIVE_SOURCE_START", await waitStatus(source));
+    assert.equal(await isSpeaking(), true);
+    await click(".ait-speech:nth-child(2)");
+    console.log("NATIVE_TARGET_START", await waitStatus(target));
+    assert.equal(await isSpeaking(), true);
+    await click(".ait-speech:nth-child(2)");
+    await wait(100);
+    assert.equal(await isSpeaking(), false);
+    console.log("NATIVE_STOP", true);
+    await click(".ait-speech");
+    await waitStatus(source);
+    await click(".ait-close");
+    await wait(100);
+    assert.equal(await isSpeaking(), false);
+    console.log("NATIVE_CLOSE_STOPS", true);
+  }
+  await translate("#sample", "de");
+  await click(".ait-speech:nth-child(2)");
+  console.log("REAL_MISSING_VOICE", await waitStatus(/未找到 de-DE 微软女声/));
+}
+
 async function main() {
   const profile = await mkdtemp(path.join(os.tmpdir(), "ai-translate-chrome-"));
+  const fault = process.env.SMOKE_FAULT;
+  const faultPrefixes = {
+    voices: "chrome.tts.getVoices=()=>{};\n",
+    speak: "chrome.tts.speak=()=>{};\n",
+    start: "chrome.tts.speak=(_text,_options,callback)=>callback();\n",
+    stop: "chrome.tts.getVoices=()=>{};chrome.tts.stop=()=>{throw new Error('simulated stop failure');};\n",
+    message: "const addMessageListener=chrome.runtime.onMessage.addListener.bind(chrome.runtime.onMessage);chrome.runtime.onMessage.addListener=listener=>addMessageListener((msg,sender,send)=>msg.type==='SPEAK_SELECTION'?true:listener(msg,sender,send));\n"
+  };
+  let extensionPath = path.resolve(__dirname, "..");
+  if (fault) {
+    assert.ok(process.env.SMOKE_LIFECYCLE && faultPrefixes[fault], "Choose a supported lifecycle fault");
+    extensionPath = path.join(profile, "extension");
+    await mkdir(path.join(extensionPath, "icons"), { recursive: true });
+    for (const file of ["manifest.json", "background.js", "speech.js", "content.js", "content.css", "popup.html", "popup.js", "icons\\icon16.png", "icons\\icon48.png", "icons\\icon128.png"]) {
+      await copyFile(path.join(__dirname, "..", file), path.join(extensionPath, file));
+    }
+    const background = path.join(extensionPath, "background.js");
+    await writeFile(background, faultPrefixes[fault] + await readFile(background, "utf8"));
+  }
   const server = http.createServer((_request, response) => {
     response.setHeader("Content-Type", "text/html; charset=utf-8");
     response.end("<!doctype html><html><body><p id='sample'>Hello world. This is a pronunciation test.</p><p id='chinese'>你好，欢迎使用划词翻译。</p></body></html>");
@@ -56,8 +188,12 @@ async function main() {
     const version = await (await fetch("http://127.0.0.1:" + port + "/json/version")).json();
     const browser = await connect(version.webSocketDebuggerUrl);
     clients.push(browser);
-    const loaded = await browser.call("Extensions.loadUnpacked", { path: path.resolve(__dirname, "..") });
+    const loaded = await browser.call("Extensions.loadUnpacked", { path: extensionPath });
     console.log("CHROME", version.Browser, "EXTENSION", loaded.id);
+    if (process.env.SMOKE_LIFECYCLE) {
+      await checkLifecycle(browser, loaded, "http://127.0.0.1:" + port, "http://127.0.0.1:" + server.address().port, clients, fault);
+      return;
+    }
     let targets;
     for (let i = 0; i < 50; i++) {
       targets = await (await fetch("http://127.0.0.1:" + port + "/json/list")).json();
@@ -70,17 +206,12 @@ async function main() {
     clients.push(worker);
     await worker.call("Runtime.enable");
     await worker.call("Runtime.runIfWaitingForDebugger");
-    const evaluate = async (client, expression) => {
-      const result = await client.call("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
-      if (result.exceptionDetails) throw new Error(JSON.stringify(result.exceptionDetails));
-      return result.result.value;
-    };
     console.log("WORKER_READY", await evaluate(worker, "({ready:!!chrome.tts, version:chrome.runtime.getManifest().version})"));
     const target = await browser.call("Target.createTarget", { url: "http://127.0.0.1:" + server.address().port });
     const pageTargets = await (await fetch("http://127.0.0.1:" + port + "/json/list")).json();
     const page = await connect(pageTargets.find((entry) => entry.id === target.targetId).webSocketDebuggerUrl);
     clients.push(page);
-    await wait(1500);
+    await waitForFixture(page);
     const tabId = await evaluate(worker, "chrome.tabs.query({url:'http://127.0.0.1/*'}).then(t => t[0].id)");
     await evaluate(worker, "globalThis.nativeEvents = []; globalThis.nativeSpeak = chrome.tts.speak; chrome.tts.speak = (text, options, callback) => { const onEvent = options.onEvent; options.onEvent = event => { nativeEvents.push(event); onEvent(event); }; nativeEvents.push({request:options.voiceName,lang:options.lang}); nativeSpeak(text, options, callback); }; true");
     const status = () => evaluate(page, "document.querySelector('.ait-speech-status')?.textContent || ''");
@@ -163,7 +294,7 @@ async function main() {
     await clickSpeech(0);
     await waitStatus(/Zira/);
     await page.call("Page.navigate", { url: "http://127.0.0.1:" + server.address().port + "/next" });
-    await wait(500);
+    await waitForFixture(page);
     assert.equal(await isSpeaking(), false);
     console.log("NAVIGATION_STOPS", true);
     await evaluate(worker, "globalThis.realTranslate=googleTranslate; googleTranslate=async(text)=>{await new Promise(r=>setTimeout(r,text.startsWith('Hello')?500:20));return {translated:text.startsWith('Hello')?'old translation':'new translation',sourceLang:text.startsWith('Hello')?'en':'zh-CN'};}; true");

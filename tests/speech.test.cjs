@@ -184,13 +184,84 @@ test("empty/oversized input and missing browser API fail without speaking", asyn
   }
   await assert.rejects(h.controller.play(message("no-tab"), {}));
   delete h.api.tts;
-  await assert.rejects(h.controller.play(message("no-api"), sender), /不支持/);
+  await assert.rejects(h.controller.play(message("no-api"), sender), /接口不可用/);
   assert.equal(h.calls.length, 0);
+});
+
+test("a stalled getVoices callback still rejects the request and notifies the UI on timeout", async () => {
+  const h = harness();
+  let callback;
+  h.api.tts.getVoices = (value) => { callback = value; };
+  const pending = h.controller.play(message("no-voices-callback"), sender);
+  const rejected = assert.rejects(pending, /读取系统语音超时/);
+  [...h.timers.values()][0].callback();
+  await rejected;
+  assert.equal(h.events.at(-1).code, "TTS_VOICES_TIMEOUT");
+  assert.equal(h.api.stops, 1);
+  callback([zira]);
+  await Promise.resolve();
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.timers.size, 0);
+});
+
+test("a stalled speak callback and missing start event are bounded; late events cannot restart speech", async () => {
+  const h = harness();
+  let options;
+  h.api.tts.speak = (_text, value) => { options = value; };
+  const pending = h.controller.play(message("no-speak-callback"), sender);
+  const rejected = assert.rejects(pending, /发音启动超时/);
+  await Promise.resolve();
+  [...h.timers.values()][0].callback();
+  await rejected;
+  assert.equal(h.events.at(-1).code, "TTS_START_TIMEOUT");
+  const count = h.events.length;
+  options.onEvent({ type: "start" });
+  assert.equal(h.events.length, count);
+  assert.equal(h.timers.size, 0);
+});
+
+test("a real start event can complete acceptance even when the speak callback is absent", async () => {
+  const h = harness();
+  let options;
+  h.api.tts.speak = (_text, value) => { options = value; };
+  const pending = h.controller.play(message("start-only"), sender);
+  await Promise.resolve();
+  options.onEvent({ type: "start" });
+  assert.equal((await pending).ok, true);
+  h.controller.stop("start-only", sender);
+  assert.equal(h.timers.size, 0);
+});
+
+test("a throwing stop API cannot hide timeout errors or leave the original request pending", async () => {
+  const h = harness();
+  h.api.tts.getVoices = () => {};
+  h.api.tts.stop = () => { throw new Error("stop unavailable"); };
+  const pending = h.controller.play(message("stop-throws"), sender);
+  const rejected = assert.rejects(pending, /读取系统语音超时.*停止发音调用失败/);
+  [...h.timers.values()][0].callback();
+  await rejected;
+  assert.equal(h.events.at(-1).state, "error");
+  assert.equal(h.events.at(-1).stopFailed, true);
+  assert.equal(h.timers.size, 0);
+});
+
+test("stop failures are returned to the caller and prevent overlapping replacement speech", async () => {
+  const h = harness();
+  await h.controller.play(message("playing"), sender);
+  h.api.tts.stop = () => { throw new Error("stop unavailable"); };
+  await assert.rejects(h.controller.play(message("replacement"), sender), /停止发音调用失败/);
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.events.at(-1).code, "TTS_STOP_FAILED");
+  await h.controller.play(message("another"), sender);
+  const stopped = h.controller.stop("another", sender);
+  assert.equal(stopped.ok, false);
+  assert.match(stopped.error, /停止发音调用失败/);
 });
 
 function backgroundHarness(config = {}, modelOutput = null) {
   let listener;
   const requests = [];
+  const logs = [];
   const event = { addListener() {} };
   const chrome = {
     runtime: { onInstalled: event, onMessage: { addListener(value) { listener = value; } } },
@@ -198,7 +269,7 @@ function backgroundHarness(config = {}, modelOutput = null) {
     tabs: { onRemoved: event, onUpdated: event },
     storage: {
       sync: { get(defaults, callback) { callback({ ...defaults, ...config }); } },
-      local: { async get() { return {}; }, async set() {} }
+      local: { async get() { return {}; }, async set(value) { logs.push(...value.aitLog); } }
     },
     i18n: { detectLanguage(_text, callback) { callback({ isReliable: false, languages: [] }); } }
   };
@@ -212,7 +283,7 @@ function backgroundHarness(config = {}, modelOutput = null) {
   });
   context.importScripts = (file) => vm.runInContext(fs.readFileSync(path.join(root, file), "utf8"), context);
   vm.runInContext(fs.readFileSync(path.join(root, "background.js"), "utf8"), context);
-  return { requests, send: (msg) => new Promise((resolve) => listener(msg, sender, resolve)) };
+  return { requests, logs, send: (msg) => new Promise((resolve) => listener(msg, sender, resolve)) };
 }
 
 test("Google selection returns detected source plus target; page batches still contain strings", async () => {
@@ -260,4 +331,15 @@ test("content script acknowledges speech status even when the result was closed"
   let acknowledged = false;
   listener({ type: "SPEECH_STATUS", requestId: "closed-result", state: "playing" }, {}, (reply) => { acknowledged = reply.ok; });
   assert.equal(acknowledged, true);
+});
+
+test("speech diagnostics only record allowlisted codes, never the selected text", async () => {
+  const h = backgroundHarness();
+  await h.send({ type: "SPEECH_DIAGNOSTIC", code: "TTS_FRONTEND_TIMEOUT", text: "private selected text" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(h.logs.join("\n"), /TTS_FRONTEND_TIMEOUT phase=content/);
+  assert.doesNotMatch(h.logs.join("\n"), /private selected text/);
+  const invalid = await h.send({ type: "SPEECH_DIAGNOSTIC", code: "private selected text" });
+  assert.equal(invalid.ok, false);
+  assert.doesNotMatch(h.logs.join("\n"), /private selected text/);
 });
