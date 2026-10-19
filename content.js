@@ -32,13 +32,77 @@
   // ---------- 划词翻译 ----------
   let triggerBtn = null;
   let resultBox = null;
+  let speechRequest = null;
 
   function removeTrigger() {
     if (triggerBtn) { triggerBtn.remove(); triggerBtn = null; }
   }
   function removeResult() {
+    stopSpeech();
     if (resultBox) { resultBox.remove(); resultBox = null; }
   }
+
+  function resetSpeechButtons(box) {
+    box.querySelectorAll(".ait-speech").forEach((button) => {
+      button.textContent = button.dataset.label;
+      button.setAttribute("aria-pressed", "false");
+    });
+  }
+
+  function stopSpeech() {
+    const request = speechRequest;
+    if (!request) return;
+    speechRequest = null;
+    resetSpeechButtons(request.box);
+    if (!alive()) return;
+    try {
+      chrome.runtime.sendMessage({ type: "STOP_SELECTION_SPEECH", requestId: request.id }, (r) => {
+        const error = chrome.runtime.lastError;
+        if (resultBox === request.box && (error || !r?.ok)) request.status.textContent = "停止发音失败，请重载扩展并刷新页面";
+      });
+    } catch {
+      if (resultBox === request.box) request.status.textContent = "停止发音失败，请重载扩展并刷新页面";
+    }
+  }
+
+  function addSpeechButton(box, bar, status, label, text, lang) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ait-speech";
+    button.dataset.label = label;
+    button.textContent = label;
+    button.setAttribute("aria-pressed", "false");
+    button.addEventListener("click", () => {
+      if (speechRequest?.button === button) {
+        stopSpeech();
+        status.textContent = "已停止";
+        return;
+      }
+      stopSpeech();
+      if (!alive()) { status.textContent = "插件已重载，请刷新页面"; return; }
+      const request = { id: crypto.randomUUID(), button, box, status };
+      speechRequest = request;
+      button.textContent = "停止" + label;
+      button.setAttribute("aria-pressed", "true");
+      status.textContent = "正在准备发音…";
+      const fail = (error) => {
+        if (speechRequest !== request) return;
+        speechRequest = null;
+        resetSpeechButtons(box);
+        status.textContent = error;
+      };
+      try {
+        chrome.runtime.sendMessage({ type: "SPEAK_SELECTION", requestId: request.id, text, lang }, (r) => {
+          const error = chrome.runtime.lastError;
+          if (error) fail("发音服务不可用，请重载扩展并刷新页面");
+          else if (!r?.ok) fail(r?.error || "发音失败：后台无响应");
+        });
+      } catch { fail("发音服务不可用，请重载扩展并刷新页面"); }
+    });
+    bar.appendChild(button);
+  }
+
+  window.addEventListener("pagehide", removeResult);
 
   document.addEventListener("mouseup", (e) => {
     if (triggerBtn && triggerBtn.contains(e.target)) return;
@@ -76,17 +140,39 @@
     resultBox.style.left = window.scrollX + rect.left + "px";
     resultBox.innerHTML = '<div class="ait-result-loading">翻译中…</div>';
     document.body.appendChild(resultBox);
+    const box = resultBox;
     getTargetLang(async (lang) => {
+      if (resultBox !== box) return;
       const r = await requestTranslate(text, lang);
-      if (!resultBox) return;
+      if (resultBox !== box) return;
       if (r.ok) {
-        resultBox.innerHTML = "";
+        box.innerHTML = "";
+        const bar = document.createElement("div");
+        bar.className = "ait-result-actions";
+        const status = document.createElement("div");
+        status.className = "ait-speech-status";
+        status.setAttribute("role", "status");
+        status.setAttribute("aria-live", "polite");
+        addSpeechButton(box, bar, status, "原文发音", text, r.sourceLang);
+        addSpeechButton(box, bar, status, "译文发音", r.translated, r.targetLang || lang);
+        const close = document.createElement("button");
+        close.type = "button";
+        close.className = "ait-close";
+        close.textContent = "关闭";
+        close.setAttribute("aria-label", "关闭译文并停止发音");
+        close.addEventListener("click", removeResult);
+        bar.appendChild(close);
+        box.appendChild(bar);
         const t = document.createElement("div");
         t.className = "ait-result-text";
         t.textContent = r.translated;
-        resultBox.appendChild(t);
+        box.appendChild(t);
+        box.appendChild(status);
       } else {
-        resultBox.innerHTML = '<div class="ait-result-loading">翻译失败：' + (r.error || "") + "</div>";
+        const error = document.createElement("div");
+        error.className = "ait-result-loading";
+        error.textContent = "翻译失败：" + (r.error || "");
+        box.replaceChildren(error);
       }
     });
   }
@@ -164,6 +250,18 @@
   }
 
   chrome.runtime.onMessage.addListener((msg, _s, send) => {
+    if (msg.type === "SPEECH_STATUS") {
+      send({ ok: true });
+      const request = speechRequest;
+      if (!request || request.id !== msg.requestId || resultBox !== request.box) return;
+      if (msg.state === "playing") request.status.textContent = msg.voiceName + " · " + msg.lang + " · 女声";
+      else {
+        speechRequest = null;
+        resetSpeechButtons(request.box);
+        request.status.textContent = msg.state === "error" ? msg.error : "已停止";
+      }
+      return;
+    }
     if (msg.type === "TRANSLATE_PAGE") translatePage();
     if (msg.type === "PAGE_STATE") { send({ translated: pageTranslated }); return true; }
     if (msg.type === "TRANSLATE_SELECTION") {
