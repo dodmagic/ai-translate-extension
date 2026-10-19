@@ -49,16 +49,30 @@
     });
   }
 
+  function reportSpeechError(code) {
+    console.warn("[AI翻译发音]", code);
+    if (!alive()) return;
+    try {
+      chrome.runtime.sendMessage({ type: "SPEECH_DIAGNOSTIC", code }, () => {
+        if (chrome.runtime.lastError) console.warn("[AI翻译发音] 无法保存诊断，请重新加载扩展");
+      });
+    } catch { console.warn("[AI翻译发音] 无法保存诊断，请刷新网页"); }
+  }
+
   function stopSpeech() {
     const request = speechRequest;
     if (!request) return;
     speechRequest = null;
+    clearTimeout(request.timer);
     resetSpeechButtons(request.box);
     if (!alive()) return;
     try {
       chrome.runtime.sendMessage({ type: "STOP_SELECTION_SPEECH", requestId: request.id }, (r) => {
         const error = chrome.runtime.lastError;
-        if (resultBox === request.box && (error || !r?.ok)) request.status.textContent = "停止发音失败，请重载扩展并刷新页面";
+        if (resultBox === request.box && !speechRequest && (error || !r?.ok)) {
+          request.status.textContent = "停止发音失败，请重载扩展并刷新页面";
+          reportSpeechError("TTS_STOP_RESPONSE_FAILED");
+        }
       });
     } catch {
       if (resultBox === request.box) request.status.textContent = "停止发音失败，请重载扩展并刷新页面";
@@ -80,6 +94,11 @@
       }
       stopSpeech();
       if (!alive()) { status.textContent = "插件已重载，请刷新页面"; return; }
+      if (!chrome.runtime.getManifest().permissions?.includes("tts")) {
+        status.textContent = "扩展发音权限尚未生效，请在扩展管理页重新加载并确认权限，然后刷新网页";
+        reportSpeechError("TTS_RELOAD_REQUIRED");
+        return;
+      }
       const request = { id: crypto.randomUUID(), button, box, status };
       speechRequest = request;
       button.textContent = "停止" + label;
@@ -87,10 +106,13 @@
       status.textContent = "正在准备发音…";
       const fail = (error) => {
         if (speechRequest !== request) return;
-        speechRequest = null;
-        resetSpeechButtons(box);
+        stopSpeech();
         status.textContent = error;
       };
+      request.timer = setTimeout(() => {
+        fail("发音准备超时，后台未完成响应，请重新加载扩展并刷新网页后重试");
+        reportSpeechError("TTS_FRONTEND_TIMEOUT");
+      }, 12000);
       try {
         chrome.runtime.sendMessage({ type: "SPEAK_SELECTION", requestId: request.id, text, lang }, (r) => {
           const error = chrome.runtime.lastError;
@@ -254,6 +276,7 @@
       send({ ok: true });
       const request = speechRequest;
       if (!request || request.id !== msg.requestId || resultBox !== request.box) return;
+      clearTimeout(request.timer);
       if (msg.state === "playing") request.status.textContent = msg.voiceName + " · " + msg.lang + " · 女声";
       else {
         speechRequest = null;
